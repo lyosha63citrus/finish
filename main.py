@@ -1,14 +1,27 @@
-﻿# -*- coding: utf-8 -*-
+# -*- coding: utf-8 -*-
 # VK-bot расписания (2 категории) + Render health-check + GitHub Gist persistence
-# Вариант B: "Ученики" = кэш известных пользователей, но показываем ТОЛЬКО тех,
-# кто сейчас состоит/подписан на сообщество (проверка через groups.isMember).
-# Отписался -> удаляем из кэша и (дополнительно) снимаем с записей.
+# Ученики = кэш известных пользователей (known_users), но показываем ТОЛЬКО тех,
+# кто сейчас состоит в сообществе (groups.isMember).
 #
-# Слоты в каждой категории имеют стабильные ключи S1..S4.
-# /setxpr и /setxbh меняют ТОЛЬКО title слотов, users НЕ трогаем.
-# Очистка записей админом: /clearpr /clearbh
+# Админка:
+# Админам -> Панель администратора:
+#   - Ученики
+#   - Админы
+#   - Незаписавшиеся ученики
+#   - Редактировать -> (Записать/Удалить) -> (Программирование/Бухгалтерия) -> список с номерами
+#       Записать: выбираем ученика номером -> выбираем слот номером -> запись
+#       Удалить: выбираем ученика номером -> удаление из предмета (все слоты предмета)
+#   - Инструкция (админ)
 #
-# НОВОЕ: Перезапись -> подменю (Программирование / Бухгалтерия / Всё)
+# Админ-команды текстом:
+#   /setxpr N d t CAP LIMIT      (точечно)
+#   /setxbh N d t CAP LIMIT
+#   /setxpr d1 t1 [d2 t2 ...] CAP LIMIT   (массово)
+#   /setxbh d1 t1 [d2 t2 ...] CAP LIMIT
+#   /delpr N   /delbh N          (удалить слот без сдвига: очищает title+users только этого слота)
+#   /clearpr   /clearbh          (очистить все записи категории)
+#
+# Ученикам в расписании НЕ показываем номера слотов.
 
 import os
 import json
@@ -127,7 +140,7 @@ if USER_TOKEN:
 else:
     print("USER_TOKEN не указан (это нормально).")
 
-# ───────────── категории ─────────────
+# ───────────── категории / команды ─────────────
 CAT_PR = "Программирование"
 CAT_BH = "Бухгалтерия"
 CATEGORIES = [CAT_PR, CAT_BH]
@@ -136,6 +149,8 @@ CMD_SET_PR = "/setxpr"
 CMD_SET_BH = "/setxbh"
 CMD_CLEAR_PR = "/clearpr"
 CMD_CLEAR_BH = "/clearbh"
+CMD_DEL_PR = "/delpr"
+CMD_DEL_BH = "/delbh"
 
 SLOT_KEYS = ["S1", "S2", "S3", "S4"]
 
@@ -210,10 +225,7 @@ def _normalize_state(data: dict) -> dict:
 
         new_slots = []
         for k in SLOT_KEYS:
-            if k in key_to_slot:
-                new_slots.append(key_to_slot[k])
-            else:
-                new_slots.append({"key": k, "title": "", "users": []})
+            new_slots.append(key_to_slot.get(k) or {"key": k, "title": "", "users": []})
         cfg["slots"] = new_slots
 
     return data
@@ -247,8 +259,12 @@ ADMINS: List[int] = [aid for aid in [MASTER_ID, 1080975674] if isinstance(aid, i
 
 # ───────────── runtime ─────────────
 pending_cat: Dict[int, str] = {}
-pending_action: Dict[int, Dict] = {}
-pending_rewrite: Dict[int, str] = {}  # user_id -> "menu" ожидание выбора что сбросить
+pending_rewrite: Dict[int, str] = {}   # user_id -> "menu"
+admin_mode: Dict[int, str] = {}        # user_id -> "" | "panel" | "edit"
+
+# админ-сценарий редактирования
+# user_id -> {"step": "op"|"cat"|"pick_student"|"pick_slot", "op":"add"|"del", "cat":..., "students":[name..], "student":..., "slots":[(title, free, taken, cap)]}
+admin_edit: Dict[int, Dict] = {}
 
 # ───────────── клавиатуры ─────────────
 def base_keyboard(is_admin: bool) -> VkKeyboard:
@@ -263,37 +279,9 @@ def base_keyboard(is_admin: bool) -> VkKeyboard:
     kb.add_button("Перезапись", VkKeyboardColor.PRIMARY)
     return kb
 
-def rewrite_keyboard() -> VkKeyboard:
-    kb = VkKeyboard(one_time=False)
-    kb.add_button("Перезапись: Программирование", VkKeyboardColor.PRIMARY)
-    kb.add_button("Перезапись: Бухгалтерия", VkKeyboardColor.PRIMARY)
-    kb.add_line()
-    kb.add_button("Перезапись: Всё", VkKeyboardColor.NEGATIVE)
-    kb.add_button("Назад", VkKeyboardColor.SECONDARY)
-    return kb
-
 def schedule_keyboard() -> VkKeyboard:
     kb = VkKeyboard(one_time=False)
     kb.add_button("Подробно", VkKeyboardColor.PRIMARY)
-    kb.add_button("Назад", VkKeyboardColor.SECONDARY)
-    return kb
-
-def admin_keyboard() -> VkKeyboard:
-    kb = VkKeyboard(one_time=False)
-    kb.add_button("Ученики", VkKeyboardColor.SECONDARY)
-    kb.add_button("Админы", VkKeyboardColor.SECONDARY)
-    kb.add_button("Незаписавшиеся ученики", VkKeyboardColor.SECONDARY)
-    kb.add_line()
-    kb.add_button("Редактировать", VkKeyboardColor.PRIMARY)
-    kb.add_line()
-    kb.add_button("Назад", VkKeyboardColor.NEGATIVE)
-    return kb
-
-def edit_keyboard() -> VkKeyboard:
-    kb = VkKeyboard(one_time=False)
-    kb.add_button("Записать ученика", VkKeyboardColor.POSITIVE)
-    kb.add_button("Удалить ученика", VkKeyboardColor.NEGATIVE)
-    kb.add_line()
     kb.add_button("Назад", VkKeyboardColor.SECONDARY)
     return kb
 
@@ -315,10 +303,60 @@ def slots_keyboard(cat: str) -> VkKeyboard:
     kb.add_button("Отмена", VkKeyboardColor.NEGATIVE)
     return kb
 
-# ───────────── helpers ─────────────
+def rewrite_keyboard() -> VkKeyboard:
+    kb = VkKeyboard(one_time=False)
+    kb.add_button("Перезапись: Программирование", VkKeyboardColor.PRIMARY)
+    kb.add_button("Перезапись: Бухгалтерия", VkKeyboardColor.PRIMARY)
+    kb.add_line()
+    kb.add_button("Перезапись: Всё", VkKeyboardColor.NEGATIVE)
+    kb.add_button("Назад", VkKeyboardColor.SECONDARY)
+    return kb
+
+def admin_keyboard() -> VkKeyboard:
+    kb = VkKeyboard(one_time=False)
+    kb.add_button("Ученики", VkKeyboardColor.SECONDARY)
+    kb.add_button("Админы", VkKeyboardColor.SECONDARY)
+    kb.add_line()
+    kb.add_button("Незаписавшиеся ученики", VkKeyboardColor.SECONDARY)
+    kb.add_line()
+    kb.add_button("Редактировать", VkKeyboardColor.PRIMARY)
+    kb.add_button("Инструкция (админ)", VkKeyboardColor.PRIMARY)
+    kb.add_line()
+    kb.add_button("Назад", VkKeyboardColor.NEGATIVE)
+    return kb
+
+def admin_edit_keyboard() -> VkKeyboard:
+    kb = VkKeyboard(one_time=False)
+    kb.add_button("Записать", VkKeyboardColor.POSITIVE)
+    kb.add_button("Удалить", VkKeyboardColor.NEGATIVE)
+    kb.add_line()
+    kb.add_button("Назад", VkKeyboardColor.SECONDARY)
+    return kb
+
+def admin_edit_cat_keyboard() -> VkKeyboard:
+    kb = VkKeyboard(one_time=False)
+    kb.add_button(CAT_PR, VkKeyboardColor.PRIMARY)
+    kb.add_button(CAT_BH, VkKeyboardColor.PRIMARY)
+    kb.add_line()
+    kb.add_button("Отмена", VkKeyboardColor.NEGATIVE)
+    kb.add_button("Назад", VkKeyboardColor.SECONDARY)
+    return kb
+
+# ───────────── сервис ─────────────
 def send_msg(user_id: int, text: str, kb: Optional[VkKeyboard] = None):
     payload = {"user_id": user_id, "message": text, "random_id": 0}
-    payload["keyboard"] = (kb or base_keyboard(user_id in ADMINS)).get_keyboard()
+
+    if kb is not None:
+        payload["keyboard"] = kb.get_keyboard()
+    else:
+        mode = admin_mode.get(user_id, "")
+        if mode == "panel":
+            payload["keyboard"] = admin_keyboard().get_keyboard()
+        elif mode == "edit":
+            payload["keyboard"] = admin_edit_keyboard().get_keyboard()
+        else:
+            payload["keyboard"] = base_keyboard(user_id in ADMINS).get_keyboard()
+
     session_api.messages.send(**payload)
 
 def roster_with_numbers(users: List[str]) -> str:
@@ -343,24 +381,24 @@ def remove_user_from_all_categories(fullname: str) -> int:
         removed += remove_user_from_category(fullname, cat)
     return removed
 
+# ───────────── Расписание (без номеров слотов) ─────────────
 def schedule_summary_text() -> str:
     lines: List[str] = ["📅 Расписание (кратко)\n"]
     for cat in CATEGORIES:
         cfg = state["categories"][cat]
         cap = int(cfg.get("capacity", 13))
-        slots = cfg.get("slots", [])
         lines.append(f"🖥 {cat}")
         any_visible = False
-        for s in slots:
+        for s in cfg.get("slots", []):
             title = (s.get("title") or "").strip()
             if not title:
                 continue
             any_visible = True
-            taken = len(s["users"])
+            taken = len(s.get("users", []))
             free = max(cap - taken, 0)
             lines.append(f"{title} | занято: {taken}/{cap} | свободно: {free}")
         if not any_visible:
-            lines.append("Слоты не настроены администратором.\n")
+            lines.append("Слоты не настроены.\n")
         lines.append("")
     lines.append("Нажмите «Подробно», чтобы увидеть списки записанных.")
     return "\n".join(lines).strip()
@@ -370,22 +408,21 @@ def schedule_detailed_text() -> str:
     for cat in CATEGORIES:
         cfg = state["categories"][cat]
         cap = int(cfg.get("capacity", 13))
-        slots = cfg.get("slots", [])
         lines.append(f"🖥 {cat}")
         any_visible = False
-        for s in slots:
+        for s in cfg.get("slots", []):
             title = (s.get("title") or "").strip()
             if not title:
                 continue
             any_visible = True
-            users = s["users"]
+            users = s.get("users", [])
             taken = len(users)
             free = max(cap - taken, 0)
             lines.append(f"{title} | занято: {taken}/{cap} | свободно: {free}\n")
             lines.append(roster_with_numbers(users))
             lines.append("")
         if not any_visible:
-            lines.append("Слоты не настроены администратором.\n")
+            lines.append("Слоты не настроены.\n")
         lines.append("")
     return "\n".join(lines).strip()
 
@@ -397,7 +434,7 @@ def my_bookings_text(fullname: str) -> str:
             title = (s.get("title") or "").strip()
             if not title:
                 continue
-            if fullname in s["users"]:
+            if fullname in s.get("users", []):
                 my.append("• " + title)
         blocks.append(f"🖥 {cat}")
         blocks.extend(my if my else ["—"])
@@ -436,17 +473,14 @@ def _groups_is_member_batch(user_ids: List[int]) -> Dict[int, bool]:
     try:
         call(session_api)
         return out
-    except Exception as e1:
+    except Exception:
         if user_api:
             try:
                 out.clear()
                 call(user_api)
                 return out
-            except Exception as e2:
-                print("groups.isMember failed:", e1, "| fallback failed:", e2)
-        else:
-            print("groups.isMember failed:", e1)
-
+            except Exception:
+                pass
     return {uid: True for uid in user_ids}
 
 def prune_known_users_and_bookings() -> Tuple[List[str], int]:
@@ -467,6 +501,7 @@ def prune_known_users_and_bookings() -> Tuple[List[str], int]:
         if not is_member:
             to_remove.append((uid_str, name))
         else:
+            # исключаем админов по id (точно)
             if uid not in ADMINS and name:
                 active_names.append(name)
 
@@ -482,23 +517,34 @@ def prune_known_users_and_bookings() -> Tuple[List[str], int]:
     active_names = sorted(set(active_names), key=lambda s: s.lower())
     return active_names, removed_count
 
-# ───────────── setx / apply_slots / clear_category ─────────────
-def parse_setx_command(raw: str):
+def users_get_names(uids: List[int]) -> List[str]:
+    if not uids:
+        return []
+    try:
+        api = user_api or session_api
+        chunks = [uids[i:i+900] for i in range(0, len(uids), 900)]
+        names: List[str] = []
+        for chunk in chunks:
+            res = api.users.get(user_ids=",".join(map(str, chunk)))
+            for u in res:
+                names.append(f"{u.get('first_name','')} {u.get('last_name','')}".strip())
+        return names
+    except Exception:
+        return [str(x) for x in uids]
+
+# ───────────── admin commands parsing ─────────────
+def _parse_setx_bulk(raw: str):
     parts = raw.strip().split()
     if len(parts) < 1 + 2 + 2:
-        return None, None, None, "Формат: /setx.. d1 t1 [d2 t2 ...] CAPACITY LIMIT"
+        return None, None, None, "Формат: /setx.. d1 t1 [d2 t2 ...] CAP LIMIT"
     try:
         capacity = int(parts[-2])
         limit = int(parts[-1])
     except Exception:
-        return None, None, None, "Последние два аргумента должны быть числами: CAPACITY LIMIT"
-    if capacity <= 0 or capacity > 500:
-        return None, None, None, "CAPACITY должен быть от 1 до 500."
-    if limit <= 0 or limit > 10:
-        return None, None, None, "LIMIT должен быть от 1 до 10."
+        return None, None, None, "Последние два аргумента должны быть числами: CAP LIMIT"
     mid = parts[1:-2]
     if len(mid) % 2 != 0:
-        return None, None, None, "Пары дата/время должны идти строго парами: d1 t1 d2 t2 ..."
+        return None, None, None, "Пары дата/время должны идти строго парами."
     pairs = []
     for i in range(0, len(mid), 2):
         d = mid[i].strip()
@@ -506,37 +552,168 @@ def parse_setx_command(raw: str):
         if d and t:
             pairs.append(f"{d} {t}")
     if not pairs:
-        return None, None, None, "Не удалось распознать пары (дата время)."
+        return None, None, None, "Не удалось распознать пары."
     if len(pairs) > 4:
         pairs = pairs[:4]
     return pairs, capacity, limit, None
 
-def apply_slots(cat: str, titles: List[str], capacity: int, limit: int):
+def _parse_setx_single(raw: str):
+    parts = raw.strip().split()
+    if len(parts) != 6:
+        return None, None, None, None, "Формат: /setx.. N d t CAP LIMIT"
+    try:
+        n = int(parts[1])
+    except Exception:
+        return None, None, None, None, "N должен быть числом 1..4."
+    if n < 1 or n > 4:
+        return None, None, None, None, "N должен быть от 1 до 4."
+    d = parts[2].strip()
+    t = parts[3].strip()
+    if not d or not t:
+        return None, None, None, None, "Дата/время не распознаны."
+    try:
+        cap = int(parts[4])
+        lim = int(parts[5])
+    except Exception:
+        return None, None, None, None, "CAP и LIMIT должны быть числами."
+    return n, f"{d} {t}", cap, lim, None
+
+def _ensure_4_slots(cat: str) -> List[dict]:
     cfg = state["categories"][cat]
     slots = cfg.get("slots", [])
     key_to_slot = {s.get("key"): s for s in slots if isinstance(s, dict)}
-    new_slots = []
+    fixed = []
     for k in SLOT_KEYS:
-        s = key_to_slot.get(k)
-        if not isinstance(s, dict):
-            s = {"key": k, "title": "", "users": []}
+        s = key_to_slot.get(k) or {"key": k, "title": "", "users": []}
         s.setdefault("users", [])
         if not isinstance(s["users"], list):
             s["users"] = []
-        new_slots.append(s)
-    for i, k in enumerate(SLOT_KEYS):
-        new_slots[i]["title"] = titles[i] if i < len(titles) else ""
+        fixed.append(s)
+    cfg["slots"] = fixed
+    return fixed
+
+def apply_slots_bulk(cat: str, titles: List[str], capacity: int, limit: int):
+    cfg = state["categories"][cat]
+    fixed = _ensure_4_slots(cat)
+    for i in range(4):
+        fixed[i]["title"] = titles[i] if i < len(titles) else ""
     cfg["capacity"] = capacity
     cfg["limit_per_user"] = limit
-    cfg["slots"] = new_slots
+    save_state()
+
+def apply_slot_single(cat: str, n: int, title: str, capacity: int, limit: int):
+    cfg = state["categories"][cat]
+    fixed = _ensure_4_slots(cat)
+    fixed[n-1]["title"] = title
+    cfg["capacity"] = capacity
+    cfg["limit_per_user"] = limit
     save_state()
 
 def clear_category(cat: str):
-    cfg = state["categories"][cat]
-    for s in cfg.get("slots", []):
-        if isinstance(s, dict):
-            s["users"] = []
+    fixed = _ensure_4_slots(cat)
+    for s in fixed:
+        s["users"] = []
     save_state()
+
+def delete_slot_no_shift(cat: str, n: int):
+    fixed = _ensure_4_slots(cat)
+    fixed[n-1]["title"] = ""
+    fixed[n-1]["users"] = []
+    save_state()
+
+# ───────────── admin edit helpers ─────────────
+def category_booked_set(cat: str) -> set:
+    booked = set()
+    for s in state["categories"][cat]["slots"]:
+        booked.update(s.get("users", []))
+    return booked
+
+def category_slots_info(cat: str) -> List[Tuple[str, int, int, int, dict]]:
+    """[(title, free, taken, cap, slot_dict)] for visible slots"""
+    cfg = state["categories"][cat]
+    cap = int(cfg.get("capacity", 13))
+    out = []
+    for s in cfg.get("slots", []):
+        title = (s.get("title") or "").strip()
+        if not title:
+            continue
+        users = s.get("users", [])
+        taken = len(users)
+        free = max(cap - taken, 0)
+        out.append((title, free, taken, cap, s))
+    return out
+
+def start_admin_edit(user_id: int):
+    admin_mode[user_id] = "edit"
+    admin_edit[user_id] = {"step": "op"}
+    send_msg(user_id, "Редактировать:\nВыберите действие:", kb=admin_edit_keyboard())
+
+def exit_admin_edit(user_id: int, to_panel: bool = True):
+    admin_edit.pop(user_id, None)
+    admin_mode[user_id] = "panel" if to_panel else ""
+    send_msg(user_id, "Ок.", kb=admin_keyboard() if to_panel else None)
+
+def show_students_list_for_edit(user_id: int):
+    st = admin_edit.get(user_id) or {}
+    op = st.get("op")
+    cat = st.get("cat")
+    if op not in {"add", "del"} or cat not in CATEGORIES:
+        send_msg(user_id, "Ошибка состояния редактирования. Нажмите «Редактировать» заново.", kb=admin_keyboard())
+        admin_edit.pop(user_id, None)
+        admin_mode[user_id] = "panel"
+        return
+
+    names, _ = prune_known_users_and_bookings()
+    booked = category_booked_set(cat)
+
+    if op == "add":
+        students = [n for n in names if n not in booked]
+        header = f"➕ Записать в «{cat}»\nВыберите ученика номером (пишете цифру):"
+    else:
+        students = [n for n in names if n in booked]
+        header = f"🗑 Удалить из «{cat}»\nВыберите ученика номером (пишете цифру):"
+
+    students = sorted(students, key=lambda s: s.lower())
+
+    st["students"] = students
+    st["step"] = "pick_student"
+    admin_edit[user_id] = st
+
+    if not students:
+        send_msg(user_id, "Список пуст.\n(Либо бот ещё не знает учеников, либо условие не подходит.)", kb=admin_keyboard())
+        exit_admin_edit(user_id, to_panel=True)
+        return
+
+    # чтобы не взорвать чат — ограничим вывод
+    MAX_SHOW = 60
+    shown = students[:MAX_SHOW]
+    body = "\n".join(f"{i+1}. {n}" for i, n in enumerate(shown))
+    tail = ""
+    if len(students) > MAX_SHOW:
+        tail = f"\n\n…и ещё {len(students)-MAX_SHOW} (слишком много для одного сообщения). Уточните/пишите номер из первых {MAX_SHOW}."
+    send_msg(user_id, f"{header}\n\n{body}{tail}\n\nОтмена — кнопка «Отмена» или «Назад».", kb=admin_edit_cat_keyboard())
+
+def show_slots_for_admin_add(user_id: int, cat: str, student_name: str):
+    info = category_slots_info(cat)
+    if not info:
+        send_msg(user_id, f"В «{cat}» нет настроенных слотов. Сначала настройте /setx..", kb=admin_keyboard())
+        exit_admin_edit(user_id, to_panel=True)
+        return
+
+    st = admin_edit.get(user_id) or {}
+    st["step"] = "pick_slot"
+    st["slots"] = [(t, free, taken, cap) for (t, free, taken, cap, _slot) in info]
+    st["student"] = student_name
+    admin_edit[user_id] = st
+
+    lines = []
+    for i, (t, free, taken, cap, _slot) in enumerate(info, start=1):
+        lines.append(f"{i}. {t} | занято: {taken}/{cap} | свободно: {free}")
+    send_msg(
+        user_id,
+        f"Выберите слот номером для «{student_name}» (пишете цифру):\n\n" + "\n".join(lines),
+        kb=admin_edit_cat_keyboard()
+    )
 
 # ───────────── проверка токена сообщества ─────────────
 try:
@@ -565,35 +742,153 @@ try:
 
                 touch_known_user(user_id, fullname)
 
-                # админ очистка
-                if mlow == CMD_CLEAR_PR and user_id in ADMINS:
-                    clear_category(CAT_PR)
-                    send_msg(user_id, "✅ Очищено: Программирование (все записи удалены).")
-                    continue
-                if mlow == CMD_CLEAR_BH and user_id in ADMINS:
-                    clear_category(CAT_BH)
-                    send_msg(user_id, "✅ Очищено: Бухгалтерия (все записи удалены).")
-                    continue
+                # ───────────── обработка выбора цифрой в админ-редактировании ─────────────
+                if user_id in ADMINS and user_id in admin_edit and msg.isdigit():
+                    st = admin_edit[user_id]
+                    step = st.get("step")
 
-                # админ setx
-                if (mlow.startswith(CMD_SET_PR) or mlow.startswith(CMD_SET_BH)) and (user_id in ADMINS):
-                    cat = CAT_PR if mlow.startswith(CMD_SET_PR) else CAT_BH
-                    titles, cap, lim, err = parse_setx_command(raw)
-                    if err:
-                        send_msg(user_id, "⚠️ " + err)
+                    # выбор ученика
+                    if step == "pick_student":
+                        students = st.get("students") or []
+                        idx = int(msg) - 1
+                        if idx < 0 or idx >= len(students):
+                            send_msg(user_id, "Неверный номер. Попробуйте ещё раз.", kb=admin_edit_cat_keyboard())
+                            continue
+                        chosen = students[idx]
+                        op = st.get("op")
+                        cat = st.get("cat")
+
+                        if op == "del":
+                            removed = remove_user_from_category(chosen, cat)
+                            if removed:
+                                save_state()
+                                send_msg(user_id, f"🗑 Удалено записей: {removed}\n{chosen} — удалён из «{cat}».", kb=admin_keyboard())
+                            else:
+                                send_msg(user_id, f"У {chosen} нет записей в «{cat}».", kb=admin_keyboard())
+                            exit_admin_edit(user_id, to_panel=True)
+                            continue
+
+                        # op == add
+                        show_slots_for_admin_add(user_id, cat, chosen)
                         continue
-                    apply_slots(cat, titles or [], cap or 13, lim or 1)
-                    send_msg(
-                        user_id,
-                        f"✅ Настроено: {cat}\n"
-                        f"Слотов: {len(titles)} | Мест: {cap} | Лимит на ученика в категории: {lim}\n\n"
-                        + "\n".join(f"• {t}" for t in titles),
-                    )
+
+                    # выбор слота
+                    if step == "pick_slot":
+                        cat = st.get("cat")
+                        student_name = st.get("student")
+                        if not cat or not student_name:
+                            send_msg(user_id, "Ошибка состояния. Начните заново.", kb=admin_keyboard())
+                            exit_admin_edit(user_id, to_panel=True)
+                            continue
+
+                        info = category_slots_info(cat)
+                        idx = int(msg) - 1
+                        if idx < 0 or idx >= len(info):
+                            send_msg(user_id, "Неверный номер слота. Попробуйте ещё раз.", kb=admin_edit_cat_keyboard())
+                            continue
+
+                        title, free, taken, cap, slot = info[idx]
+                        cfg = state["categories"][cat]
+                        lim = int(cfg.get("limit_per_user", 1))
+
+                        # страховки
+                        if count_user_bookings_in_category(student_name, cat) >= lim:
+                            send_msg(user_id, f"У {student_name} уже есть запись в «{cat}». Сначала удалите.", kb=admin_keyboard())
+                            exit_admin_edit(user_id, to_panel=True)
+                            continue
+                        if len(slot.get("users", [])) >= cap:
+                            send_msg(user_id, f"Слот переполнен ({cap}). Выберите другой слот.", kb=admin_edit_cat_keyboard())
+                            continue
+
+                        # записываем
+                        slot["users"].append(student_name)
+                        save_state()
+                        send_msg(user_id, f"✅ Записан: {student_name}\n{cat} → {title}", kb=admin_keyboard())
+                        exit_admin_edit(user_id, to_panel=True)
+                        continue
+
+                # ───────────── ГЛОБАЛЬНО: "Назад" / "Отмена" ─────────────
+                if msg == "Отмена":
+                    pending_cat.pop(user_id, None)
+                    pending_rewrite.pop(user_id, None)
+                    if user_id in admin_edit:
+                        exit_admin_edit(user_id, to_panel=True)
+                        continue
+                    send_msg(user_id, "Ок, отменено.")
                     continue
 
-                # меню
+                if msg == "Назад":
+                    if admin_mode.get(user_id) == "edit":
+                        # назад из режима редактирования -> в админ-панель
+                        admin_edit.pop(user_id, None)
+                        admin_mode[user_id] = "panel"
+                        send_msg(user_id, "Панель администратора:", kb=admin_keyboard())
+                        continue
+                    if admin_mode.get(user_id) == "panel":
+                        admin_mode[user_id] = ""
+                        send_msg(user_id, "Ок.")
+                        continue
+                    if pending_rewrite.get(user_id) == "menu":
+                        pending_rewrite.pop(user_id, None)
+                        send_msg(user_id, "Ок.")
+                        continue
+                    send_msg(user_id, "Ок.")
+                    continue
+
+                # ───────────── админ-команды текстом ─────────────
+                if user_id in ADMINS:
+                    if mlow == CMD_CLEAR_PR:
+                        clear_category(CAT_PR)
+                        send_msg(user_id, "✅ Очищено: Программирование (все записи удалены).")
+                        continue
+                    if mlow == CMD_CLEAR_BH:
+                        clear_category(CAT_BH)
+                        send_msg(user_id, "✅ Очищено: Бухгалтерия (все записи удалены).")
+                        continue
+
+                    if mlow.startswith(CMD_DEL_PR) or mlow.startswith(CMD_DEL_BH):
+                        parts = raw.strip().split()
+                        if len(parts) != 2 or not parts[1].isdigit():
+                            send_msg(user_id, "Формат: /delpr N  или  /delbh N (N=1..4)")
+                            continue
+                        n = int(parts[1])
+                        if n < 1 or n > 4:
+                            send_msg(user_id, "N должен быть от 1 до 4.")
+                            continue
+                        cat = CAT_PR if mlow.startswith(CMD_DEL_PR) else CAT_BH
+                        delete_slot_no_shift(cat, n)
+                        send_msg(user_id, f"✅ Удалён слот {n} в «{cat}» (без сдвига).")
+                        continue
+
+                    if mlow.startswith(CMD_SET_PR) or mlow.startswith(CMD_SET_BH):
+                        cat = CAT_PR if mlow.startswith(CMD_SET_PR) else CAT_BH
+
+                        n, title, cap, lim, err_single = _parse_setx_single(raw)
+                        if err_single is None:
+                            apply_slot_single(cat, n, title, cap, lim)
+                            send_msg(user_id, f"✅ Обновлён слот {n} в «{cat}»: {title}\nCAP={cap}, LIMIT={lim}")
+                            continue
+
+                        titles, cap2, lim2, err_bulk = _parse_setx_bulk(raw)
+                        if err_bulk:
+                            send_msg(
+                                user_id,
+                                "⚠️ " + err_bulk + "\n\nПримеры:\n"
+                                "/setxpr 1 19.01 18:00-20:00 12 1\n"
+                                "/setxbh 4 22.01 18:00-20:00 12 1\n"
+                                "/setxpr 19.01 18:00-20:00 20.01 18:00-20:00 12 1"
+                            )
+                            continue
+                        apply_slots_bulk(cat, titles or [], cap2 or 13, lim2 or 1)
+                        send_msg(user_id, f"✅ Обновлено расписание «{cat}» (без сброса записей).")
+                        continue
+
+                # ───────────── меню ─────────────
                 if mlow in {"старт", "start", "привет", "меню"}:
                     pending_rewrite.pop(user_id, None)
+                    pending_cat.pop(user_id, None)
+                    admin_edit.pop(user_id, None)
+                    admin_mode[user_id] = ""
                     send_msg(user_id, "Выберите действие:")
                     continue
 
@@ -602,7 +897,7 @@ try:
                         user_id,
                         "🧾 Инструкция\n\n"
                         "• «Выбрать» → выберите направление, затем слот.\n"
-                        "• «Перезапись» → теперь можно сбросить одну категорию или всё.\n"
+                        "• «Перезапись» → сбросить одну категорию или всё.\n"
                         "• «Расписание» → кратко, затем «Подробно».\n"
                         "• «Мои записи» → ваши записи.\n"
                     )
@@ -620,7 +915,7 @@ try:
                     send_msg(user_id, my_bookings_text(fullname))
                     continue
 
-                # ── Перезапись: подменю ──
+                # Перезапись
                 if msg == "Перезапись":
                     pending_rewrite[user_id] = "menu"
                     send_msg(user_id, "Что сбросить?", kb=rewrite_keyboard())
@@ -631,7 +926,7 @@ try:
                         removed = remove_user_from_category(fullname, CAT_PR)
                         if removed:
                             save_state()
-                            send_msg(user_id, "✅ Сброшено: Программирование. Теперь можете выбрать слот заново.")
+                            send_msg(user_id, "✅ Сброшено: Программирование. Теперь выберите слот заново.")
                         else:
                             send_msg(user_id, "У вас нет записей в Программировании.")
                         pending_rewrite.pop(user_id, None)
@@ -641,7 +936,7 @@ try:
                         removed = remove_user_from_category(fullname, CAT_BH)
                         if removed:
                             save_state()
-                            send_msg(user_id, "✅ Сброшено: Бухгалтерия. Теперь можете выбрать слот заново.")
+                            send_msg(user_id, "✅ Сброшено: Бухгалтерия. Теперь выберите слот заново.")
                         else:
                             send_msg(user_id, "У вас нет записей в Бухгалтерии.")
                         pending_rewrite.pop(user_id, None)
@@ -651,18 +946,130 @@ try:
                         removed = remove_user_from_all_categories(fullname)
                         if removed:
                             save_state()
-                            send_msg(user_id, "✅ Ваши записи очищены. Теперь можете выбрать слоты заново.")
+                            send_msg(user_id, "✅ Ваши записи очищены. Теперь выберите слоты заново.")
                         else:
                             send_msg(user_id, "У вас нет активных записей.")
                         pending_rewrite.pop(user_id, None)
                         continue
 
-                    if msg == "Назад":
-                        pending_rewrite.pop(user_id, None)
-                        send_msg(user_id, "Ок.")
+                # ───────────── админ-панель ─────────────
+                if msg == "Админам":
+                    if user_id not in ADMINS:
+                        send_msg(user_id, "🚫 Вы не администратор.")
+                        continue
+                    admin_mode[user_id] = "panel"
+                    admin_edit.pop(user_id, None)
+                    send_msg(user_id, "Панель администратора:", kb=admin_keyboard())
+                    continue
+
+                if msg == "Редактировать":
+                    if user_id not in ADMINS:
+                        send_msg(user_id, "🚫 Вы не администратор.")
+                        continue
+                    start_admin_edit(user_id)
+                    continue
+
+                if user_id in ADMINS and admin_mode.get(user_id) == "edit":
+                    # шаг 1: выбор операции
+                    if msg == "Записать":
+                        admin_edit[user_id] = {"step": "cat", "op": "add"}
+                        send_msg(user_id, "Куда записать? Выберите предмет:", kb=admin_edit_cat_keyboard())
+                        continue
+                    if msg == "Удалить":
+                        admin_edit[user_id] = {"step": "cat", "op": "del"}
+                        send_msg(user_id, "Откуда удалить? Выберите предмет:", kb=admin_edit_cat_keyboard())
                         continue
 
-                # выбор
+                    # шаг 2: выбор категории
+                    st = admin_edit.get(user_id) or {}
+                    if st.get("step") == "cat" and msg in {CAT_PR, CAT_BH}:
+                        st["cat"] = msg
+                        admin_edit[user_id] = st
+                        show_students_list_for_edit(user_id)
+                        continue
+
+                if msg == "Инструкция (админ)":
+                    if user_id not in ADMINS:
+                        send_msg(user_id, "🚫 Вы не администратор.")
+                        continue
+                    text = (
+                        "🛠 Инструкция для админа\n\n"
+                        "Точечная настройка слота:\n"
+                        "• /setxpr N ДАТА ВРЕМЯ CAP LIMIT\n"
+                        "  пример: /setxpr 1 19.01 18:00-20:00 12 1\n"
+                        "• /setxbh N ДАТА ВРЕМЯ CAP LIMIT\n"
+                        "  пример: /setxbh 4 22.01 18:00-20:00 12 1\n\n"
+                        "Массовая настройка (до 4 слотов):\n"
+                        "• /setxpr d1 t1 [d2 t2 ...] CAP LIMIT\n"
+                        "  пример: /setxpr 19.01 18:00-20:00 20.01 18:00-20:00 12 1\n"
+                        "• /setxbh d1 t1 [d2 t2 ...] CAP LIMIT\n\n"
+                        "Удаление слота БЕЗ сдвига:\n"
+                        "• /delpr N  — очистит только слот N в Программировании\n"
+                        "• /delbh N  — очистит только слот N в Бухгалтерии\n\n"
+                        "Полная очистка категории:\n"
+                        "• /clearpr\n"
+                        "• /clearbh\n\n"
+                        "Редактирование через кнопки:\n"
+                        "Админам → Редактировать → Записать/Удалить → Предмет → номер ученика → (для записи) номер слота"
+                    )
+                    send_msg(user_id, text, kb=admin_keyboard())
+                    continue
+
+                if msg == "Админы":
+                    if user_id not in ADMINS:
+                        send_msg(user_id, "🚫 Вы не администратор.")
+                        continue
+                    ids_all = sorted(set([i for i in ADMINS if isinstance(i, int)]))
+                    names = users_get_names(ids_all)
+                    body = "\n".join(f"{i+1}. {n}" for i, n in enumerate(names)) or "—"
+                    send_msg(user_id, f"🛡 Администраторы ({len(ids_all)}):\n{body}", kb=admin_keyboard())
+                    continue
+
+                if msg == "Ученики":
+                    if user_id not in ADMINS:
+                        send_msg(user_id, "🚫 Вы не администратор.")
+                        continue
+                    names, removed = prune_known_users_and_bookings()
+                    if not names:
+                        send_msg(user_id, "👥 Ученики: — (бот ещё никого не знает или все отписались).", kb=admin_keyboard())
+                        continue
+                    body = "\n".join(f"{i+1}. {n}" for i, n in enumerate(names))
+                    extra = f"\n\n(Удалено из кэша: {removed})" if removed else ""
+                    send_msg(user_id, f"👥 Ученики ({len(names)}):\n{body}{extra}", kb=admin_keyboard())
+                    continue
+
+                if msg == "Незаписавшиеся ученики":
+                    if user_id not in ADMINS:
+                        send_msg(user_id, "🚫 Вы не администратор.")
+                        continue
+
+                    names, removed = prune_known_users_and_bookings()
+                    if not names:
+                        send_msg(user_id, "📋 Незаписавшиеся: — (бот ещё никого не знает или все отписались).", kb=admin_keyboard())
+                        continue
+
+                    booked_pr = category_booked_set(CAT_PR)
+                    booked_bh = category_booked_set(CAT_BH)
+
+                    lines = []
+                    for n in names:
+                        missing = []
+                        if n not in booked_pr:
+                            missing.append(CAT_PR)
+                        if n not in booked_bh:
+                            missing.append(CAT_BH)
+                        if missing:
+                            lines.append(f"• {n} — не записан(а): {', '.join(missing)}")
+
+                    if not lines:
+                        send_msg(user_id, "📋 Незаписавшиеся ученики: нет.", kb=admin_keyboard())
+                        continue
+
+                    extra = f"\n\n(Удалено из кэша: {removed})" if removed else ""
+                    send_msg(user_id, f"📋 Незаписавшиеся ученики ({len(lines)}):\n\n" + "\n".join(lines) + extra, kb=admin_keyboard())
+                    continue
+
+                # ───────────── выбор направления/слота для ученика ─────────────
                 if msg == "Выбрать":
                     pending_cat.pop(user_id, None)
                     send_msg(user_id, "Выберите направление:", kb=choose_category_keyboard())
@@ -670,7 +1077,11 @@ try:
 
                 if msg in {CAT_PR, CAT_BH}:
                     pending_cat[user_id] = msg
-                    visible_titles = [(s.get("title") or "").strip() for s in state["categories"][msg]["slots"] if (s.get("title") or "").strip()]
+                    visible_titles = [
+                        (s.get("title") or "").strip()
+                        for s in state["categories"][msg]["slots"]
+                        if (s.get("title") or "").strip()
+                    ]
                     if not visible_titles:
                         send_msg(user_id, "⚠️ Слоты пока не настроены администратором.")
                         pending_cat.pop(user_id, None)
@@ -709,58 +1120,6 @@ try:
                         pending_cat.pop(user_id, None)
                         send_msg(user_id, f"✅ Записаны: {cat} → {slot['title']}")
                         continue
-
-                if msg == "Отмена":
-                    pending_cat.pop(user_id, None)
-                    pending_action.pop(user_id, None)
-                    pending_rewrite.pop(user_id, None)
-                    send_msg(user_id, "Ок, отменено.")
-                    continue
-
-                # Админка (оставил только ключевые кнопки, как было)
-                if msg == "Админам":
-                    if user_id not in ADMINS:
-                        send_msg(user_id, "🚫 Вы не администратор.")
-                        continue
-                    send_msg(user_id, "Панель администратора:", kb=admin_keyboard())
-                    continue
-
-                if msg == "Ученики" and user_id in ADMINS:
-                    names, removed = prune_known_users_and_bookings()
-                    if not names:
-                        send_msg(user_id, "👥 Ученики: —")
-                    else:
-                        body = "\n".join(f"{i+1}. {n}" for i, n in enumerate(names))
-                        extra = f"\n\n(Удалено из кэша: {removed})" if removed else ""
-                        send_msg(user_id, f"👥 Ученики ({len(names)}):\n{body}{extra}")
-                    continue
-
-                if msg == "Незаписавшиеся ученики" and user_id in ADMINS:
-                    names, removed = prune_known_users_and_bookings()
-                    if not names:
-                        send_msg(user_id, "📋 Незаписавшиеся: —")
-                        continue
-                    booked_pr = set()
-                    booked_bh = set()
-                    for s in state["categories"][CAT_PR]["slots"]:
-                        booked_pr.update(s["users"])
-                    for s in state["categories"][CAT_BH]["slots"]:
-                        booked_bh.update(s["users"])
-                    lines = []
-                    for n in names:
-                        missing = []
-                        if n not in booked_pr:
-                            missing.append(CAT_PR)
-                        if n not in booked_bh:
-                            missing.append(CAT_BH)
-                        if missing:
-                            lines.append(f"• {n} — не записан(а): {', '.join(missing)}")
-                    if not lines:
-                        send_msg(user_id, "📋 Незаписавшиеся ученики: нет.")
-                    else:
-                        extra = f"\n\n(Удалено из кэша: {removed})" if removed else ""
-                        send_msg(user_id, f"📋 Незаписавшиеся ученики ({len(lines)}):\n\n" + "\n".join(lines) + extra)
-                    continue
 
                 send_msg(user_id, "Не понял команду. Выберите действие:")
 
