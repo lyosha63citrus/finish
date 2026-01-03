@@ -1,7 +1,10 @@
 # -*- coding: utf-8 -*-
 # VK-bot расписания (2 категории) + Render health-check + GitHub Gist persistence
-# Ученики = кэш известных пользователей (known_users), но показываем ТОЛЬКО тех,
-# кто сейчас состоит в сообществе (groups.isMember).
+#
+# ВАЖНО (фикс):
+# - "Ученики" / "Незаписавшиеся" / "Редактировать" берут список НЕ из known_users,
+#   а из реального списка участников сообщества через user_token: groups.getMembers.
+# - Никаких удалений записей при нажатии "Ученики".
 #
 # Админка:
 # Админам -> Панель администратора:
@@ -117,7 +120,7 @@ def gist_save(filename: str, obj: dict) -> None:
 # ───────────── env ─────────────
 COMMUNITY_TOKEN = os.getenv("VK_TOKEN")
 GROUP_ID = int(os.getenv("GROUP_ID", "0"))
-USER_TOKEN = os.getenv("USER_TOKEN")         # опционально
+USER_TOKEN = os.getenv("USER_TOKEN")         # ВАЖНО: нужен для выгрузки участников
 MASTER_ID_ENV = os.getenv("ADMIN_USER_ID")   # VK user_id (число)
 
 if not COMMUNITY_TOKEN or not GROUP_ID:
@@ -138,7 +141,7 @@ if USER_TOKEN:
     except Exception as e:
         print("Проблема с USER_TOKEN:", e)
 else:
-    print("USER_TOKEN не указан (это нормально).")
+    print("⚠️ USER_TOKEN не указан. Списки участников (Ученики/Незаписавшиеся/Редактировать) будут работать хуже.")
 
 # ───────────── категории / команды ─────────────
 CAT_PR = "Программирование"
@@ -166,7 +169,7 @@ def _default_category_cfg() -> Dict:
 
 def default_state() -> Dict:
     return {
-        "known_users": {},  # "uid": {"name": "Имя Фамилия"}
+        "known_users": {},  # "uid": {"name": "Имя Фамилия"} (оставим — полезно, но не используем как источник "учеников")
         "categories": {
             CAT_PR: _default_category_cfg(),
             CAT_BH: _default_category_cfg(),
@@ -255,6 +258,7 @@ state = load_state()
 
 # ───────────── админы ─────────────
 MASTER_ID: Optional[int] = int(MASTER_ID_ENV) if (MASTER_ID_ENV and MASTER_ID_ENV.isdigit()) else None
+# оставил твои id как в main(4).py
 ADMINS: List[int] = [aid for aid in [MASTER_ID, 1080975674, 20158141] if isinstance(aid, int)]
 
 # ───────────── runtime ─────────────
@@ -263,7 +267,7 @@ pending_rewrite: Dict[int, str] = {}   # user_id -> "menu"
 admin_mode: Dict[int, str] = {}        # user_id -> "" | "panel" | "edit"
 
 # админ-сценарий редактирования
-# user_id -> {"step": "op"|"cat"|"pick_student"|"pick_slot", "op":"add"|"del", "cat":..., "students":[name..], "student":..., "slots":[(title, free, taken, cap)]}
+# user_id -> {"step": "op"|"cat"|"pick_student"|"pick_slot", "op":"add"|"del", "cat":..., "students":[name..], "student":...}
 admin_edit: Dict[int, Dict] = {}
 
 # ───────────── клавиатуры ─────────────
@@ -442,7 +446,7 @@ def my_bookings_text(fullname: str) -> str:
     text = "\n".join(blocks).strip()
     return "Вы никуда не записаны.\n\n" + text if "•" not in text else "Ваши записи:\n\n" + text
 
-# ───────────── known_users + isMember ─────────────
+# ───────────── known_users (оставим как кэш кто писал) ─────────────
 def touch_known_user(uid: int, fullname: str):
     ku = state.setdefault("known_users", {})
     key = str(uid)
@@ -455,67 +459,98 @@ def touch_known_user(uid: int, fullname: str):
         entry["name"] = fullname
         save_state()
 
-def _groups_is_member_batch(user_ids: List[int]) -> Dict[int, bool]:
-    if not user_ids:
-        return {}
-    CHUNK = 500
-    out: Dict[int, bool] = {}
+# ───────────── ВЫГРУЗКА УЧАСТНИКОВ ЧЕРЕЗ USER_TOKEN (как в "нормальном" боте) ─────────────
+_members_cache: List[Tuple[int, str]] = []
+_members_cache_ts: float = 0.0
+MEMBERS_CACHE_TTL = 120  # секунд
 
-    def call(api):
-        for i in range(0, len(user_ids), CHUNK):
-            chunk = user_ids[i:i+CHUNK]
-            res = api.groups.isMember(group_id=GROUP_ID, user_ids=",".join(map(str, chunk)))
-            if isinstance(res, list):
-                for it in res:
-                    uid = int(it.get("user_id", 0))
-                    out[uid] = bool(it.get("member", 0))
+def fetch_admin_ids_via_user_token() -> List[int]:
+    """Берём managers (руководители) через user_api. Это те, кого надо исключать из учеников."""
+    if not user_api:
+        return []
+    ids: List[int] = []
+    offset, total = 0, None
+    while True:
+        data = user_api.groups.getMembers(
+            group_id=GROUP_ID,
+            filter="managers",
+            fields="id",
+            count=200,
+            offset=offset
+        )
+        if total is None:
+            total = data.get("count", 0)
+        items = data.get("items", [])
+        for it in items:
+            if isinstance(it, dict) and "id" in it:
+                ids.append(int(it["id"]))
+            elif isinstance(it, int):
+                ids.append(int(it))
+        offset += len(items)
+        if offset >= total or not items:
+            break
+    return ids
 
-    try:
-        call(session_api)
-        return out
-    except Exception:
-        if user_api:
-            try:
-                out.clear()
-                call(user_api)
-                return out
-            except Exception:
-                pass
-    return {uid: True for uid in user_ids}
+def fetch_members_excluding_admins(force: bool = False) -> List[Tuple[int, str]]:
+    """
+    Возвращает список [(uid, "Имя Фамилия"), ...] по реальным участникам сообщества,
+    исключая админов (managers + локальные ADMINS).
+    """
+    global _members_cache, _members_cache_ts
 
-def prune_known_users_and_bookings() -> Tuple[List[str], int]:
-    ku = state.get("known_users", {}) or {}
-    ids: List[int] = [int(k) for k in ku.keys() if str(k).isdigit()]
-    membership = _groups_is_member_batch(ids)
+    if not user_api:
+        # без user_token не можем выгрузить всех подписчиков
+        return []
 
-    removed_count = 0
-    active_names: List[str] = []
-    to_remove: List[Tuple[str, str]] = []
+    now = time.time()
+    if (not force) and _members_cache and (now - _members_cache_ts) < MEMBERS_CACHE_TTL:
+        return _members_cache
 
-    for uid in ids:
-        uid_str = str(uid)
-        entry = ku.get(uid_str, {})
-        name = entry.get("name", "").strip() if isinstance(entry, dict) else ""
-        is_member = membership.get(uid, True)
+    admin_ids = set(fetch_admin_ids_via_user_token()) | set(ADMINS)
 
-        if not is_member:
-            to_remove.append((uid_str, name))
-        else:
-            # исключаем админов по id (точно)
-            if uid not in ADMINS and name:
-                active_names.append(name)
+    out: List[Tuple[int, str]] = []
+    offset, total = 0, None
+    while True:
+        data = user_api.groups.getMembers(
+            group_id=GROUP_ID,
+            fields="first_name,last_name,id",
+            count=1000,
+            offset=offset
+        )
+        if total is None:
+            total = data.get("count", 0)
+        items = data.get("items", [])
+        for it in items:
+            if not isinstance(it, dict):
+                continue
+            uid = int(it.get("id", 0))
+            if uid <= 0:
+                continue
+            first = it.get("first_name") or ""
+            last = it.get("last_name") or ""
+            name = f"{first} {last}".strip()
+            if not name:
+                continue
+            if uid in admin_ids:
+                continue
+            out.append((uid, name))
 
-    if to_remove:
-        for uid_str, name in to_remove:
-            ku.pop(uid_str, None)
-            removed_count += 1
-            if name:
-                remove_user_from_all_categories(name)
-        state["known_users"] = ku
-        save_state()
+        offset += len(items)
+        if offset >= total or not items:
+            break
 
-    active_names = sorted(set(active_names), key=lambda s: s.lower())
-    return active_names, removed_count
+    # уникализируем по uid
+    seen = set()
+    uniq = []
+    for uid, name in out:
+        if uid in seen:
+            continue
+        seen.add(uid)
+        uniq.append((uid, name))
+
+    _members_cache = uniq
+    _members_cache_ts = now
+    return uniq
 
 def users_get_names(uids: List[int]) -> List[str]:
     if not uids:
@@ -653,6 +688,33 @@ def exit_admin_edit(user_id: int, to_panel: bool = True):
     admin_mode[user_id] = "panel" if to_panel else ""
     send_msg(user_id, "Ок.", kb=admin_keyboard() if to_panel else None)
 
+def _get_members_names_source() -> List[str]:
+    """
+    Источник "учеников" для списков.
+    1) Если есть USER_TOKEN -> реальные участники groups.getMembers
+    2) Иначе -> fallback на known_users (кто писал боту). Без чисток.
+    """
+    if user_api:
+        members = fetch_members_excluding_admins(force=False)
+        return sorted([name for (_uid, name) in members], key=lambda s: s.lower())
+
+    # fallback (хуже, но хоть что-то)
+    ku = state.get("known_users", {}) or {}
+    names = []
+    for k, v in ku.items():
+        if not str(k).isdigit():
+            continue
+        uid = int(k)
+        if uid in ADMINS:
+            continue
+        if isinstance(v, dict):
+            nm = (v.get("name") or "").strip()
+        else:
+            nm = str(v).strip()
+        if nm:
+            names.append(nm)
+    return sorted(list(set(names)), key=lambda s: s.lower())
+
 def show_students_list_for_edit(user_id: int):
     st = admin_edit.get(user_id) or {}
     op = st.get("op")
@@ -663,7 +725,7 @@ def show_students_list_for_edit(user_id: int):
         admin_mode[user_id] = "panel"
         return
 
-    names, _ = prune_known_users_and_bookings()
+    names = _get_members_names_source()
     booked = category_booked_set(cat)
 
     if op == "add":
@@ -674,23 +736,22 @@ def show_students_list_for_edit(user_id: int):
         header = f"🗑 Удалить из «{cat}»\nВыберите ученика номером (пишете цифру):"
 
     students = sorted(students, key=lambda s: s.lower())
-
     st["students"] = students
     st["step"] = "pick_student"
     admin_edit[user_id] = st
 
     if not students:
-        send_msg(user_id, "Список пуст.\n(Либо бот ещё не знает учеников, либо условие не подходит.)", kb=admin_keyboard())
+        send_msg(user_id, "Список пуст.\n(Либо никто не подходит под условие.)", kb=admin_keyboard())
         exit_admin_edit(user_id, to_panel=True)
         return
 
-    # чтобы не взорвать чат — ограничим вывод
     MAX_SHOW = 60
     shown = students[:MAX_SHOW]
     body = "\n".join(f"{i+1}. {n}" for i, n in enumerate(shown))
     tail = ""
     if len(students) > MAX_SHOW:
-        tail = f"\n\n…и ещё {len(students)-MAX_SHOW} (слишком много для одного сообщения). Уточните/пишите номер из первых {MAX_SHOW}."
+        tail = f"\n\n…и ещё {len(students)-MAX_SHOW} (слишком много). Выберите номер из первых {MAX_SHOW}."
+
     send_msg(user_id, f"{header}\n\n{body}{tail}\n\nОтмена — кнопка «Отмена» или «Назад».", kb=admin_edit_cat_keyboard())
 
 def show_slots_for_admin_add(user_id: int, cat: str, student_name: str):
@@ -702,7 +763,6 @@ def show_slots_for_admin_add(user_id: int, cat: str, student_name: str):
 
     st = admin_edit.get(user_id) or {}
     st["step"] = "pick_slot"
-    st["slots"] = [(t, free, taken, cap) for (t, free, taken, cap, _slot) in info]
     st["student"] = student_name
     admin_edit[user_id] = st
 
@@ -754,6 +814,7 @@ try:
                         if idx < 0 or idx >= len(students):
                             send_msg(user_id, "Неверный номер. Попробуйте ещё раз.", kb=admin_edit_cat_keyboard())
                             continue
+
                         chosen = students[idx]
                         op = st.get("op")
                         cat = st.get("cat")
@@ -791,16 +852,15 @@ try:
                         cfg = state["categories"][cat]
                         lim = int(cfg.get("limit_per_user", 1))
 
-                        # страховки
                         if count_user_bookings_in_category(student_name, cat) >= lim:
                             send_msg(user_id, f"У {student_name} уже есть запись в «{cat}». Сначала удалите.", kb=admin_keyboard())
                             exit_admin_edit(user_id, to_panel=True)
                             continue
+
                         if len(slot.get("users", [])) >= cap:
                             send_msg(user_id, f"Слот переполнен ({cap}). Выберите другой слот.", kb=admin_edit_cat_keyboard())
                             continue
 
-                        # записываем
                         slot["users"].append(student_name)
                         save_state()
                         send_msg(user_id, f"✅ Записан: {student_name}\n{cat} → {title}", kb=admin_keyboard())
@@ -819,7 +879,6 @@ try:
 
                 if msg == "Назад":
                     if admin_mode.get(user_id) == "edit":
-                        # назад из режима редактирования -> в админ-панель
                         admin_edit.pop(user_id, None)
                         admin_mode[user_id] = "panel"
                         send_msg(user_id, "Панель администратора:", kb=admin_keyboard())
@@ -970,7 +1029,6 @@ try:
                     continue
 
                 if user_id in ADMINS and admin_mode.get(user_id) == "edit":
-                    # шаг 1: выбор операции
                     if msg == "Записать":
                         admin_edit[user_id] = {"step": "cat", "op": "add"}
                         send_msg(user_id, "Куда записать? Выберите предмет:", kb=admin_edit_cat_keyboard())
@@ -980,7 +1038,6 @@ try:
                         send_msg(user_id, "Откуда удалить? Выберите предмет:", kb=admin_edit_cat_keyboard())
                         continue
 
-                    # шаг 2: выбор категории
                     st = admin_edit.get(user_id) or {}
                     if st.get("step") == "cat" and msg in {CAT_PR, CAT_BH}:
                         st["cat"] = msg
@@ -1029,13 +1086,24 @@ try:
                     if user_id not in ADMINS:
                         send_msg(user_id, "🚫 Вы не администратор.")
                         continue
-                    names, removed = prune_known_users_and_bookings()
-                    if not names:
-                        send_msg(user_id, "👥 Ученики: — (бот ещё никого не знает или все отписались).", kb=admin_keyboard())
+
+                    if not user_api:
+                        # fallback без user_token
+                        names = _get_members_names_source()
+                        if not names:
+                            send_msg(user_id, "👥 Ученики: — (нет USER_TOKEN и кэш пуст).", kb=admin_keyboard())
+                        else:
+                            body = "\n".join(f"{i+1}. {n}" for i, n in enumerate(names))
+                            send_msg(user_id, f"👥 Ученики ({len(names)}):\n{body}\n\n⚠️ Без USER_TOKEN список может быть неполным.", kb=admin_keyboard())
                         continue
-                    body = "\n".join(f"{i+1}. {n}" for i, n in enumerate(names))
-                    extra = f"\n\n(Удалено из кэша: {removed})" if removed else ""
-                    send_msg(user_id, f"👥 Ученики ({len(names)}):\n{body}{extra}", kb=admin_keyboard())
+
+                    try:
+                        members = fetch_members_excluding_admins(force=True)
+                        names = sorted([name for (_uid, name) in members], key=lambda s: s.lower())
+                        body = "\n".join(f"{i+1}. {n}" for i, n in enumerate(names)) or "—"
+                        send_msg(user_id, f"👥 Ученики ({len(names)}):\n{body}", kb=admin_keyboard())
+                    except Exception as e:
+                        send_msg(user_id, f"⚠️ Не удалось получить список учеников: {e}", kb=admin_keyboard())
                     continue
 
                 if msg == "Незаписавшиеся ученики":
@@ -1043,9 +1111,9 @@ try:
                         send_msg(user_id, "🚫 Вы не администратор.")
                         continue
 
-                    names, removed = prune_known_users_and_bookings()
+                    names = _get_members_names_source()
                     if not names:
-                        send_msg(user_id, "📋 Незаписавшиеся: — (бот ещё никого не знает или все отписались).", kb=admin_keyboard())
+                        send_msg(user_id, "📋 Незаписавшиеся: — (нет данных о подписчиках).", kb=admin_keyboard())
                         continue
 
                     booked_pr = category_booked_set(CAT_PR)
@@ -1063,10 +1131,8 @@ try:
 
                     if not lines:
                         send_msg(user_id, "📋 Незаписавшиеся ученики: нет.", kb=admin_keyboard())
-                        continue
-
-                    extra = f"\n\n(Удалено из кэша: {removed})" if removed else ""
-                    send_msg(user_id, f"📋 Незаписавшиеся ученики ({len(lines)}):\n\n" + "\n".join(lines) + extra, kb=admin_keyboard())
+                    else:
+                        send_msg(user_id, f"📋 Незаписавшиеся ученики ({len(lines)}):\n\n" + "\n".join(lines), kb=admin_keyboard())
                     continue
 
                 # ───────────── выбор направления/слота для ученика ─────────────
@@ -1131,4 +1197,3 @@ try:
 
 except KeyboardInterrupt:
     print("\n🛑 Бот остановлен пользователем (Ctrl+C). До встречи!")
-
